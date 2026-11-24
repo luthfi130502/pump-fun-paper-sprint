@@ -15,6 +15,12 @@
 // Determinism: every decision comes from the harness state alone (slots,
 // reserves, trade counts). No clock, no randomness, no environment reads,
 // so two runs produce identical action logs.
+//
+// Speed: the entry scan walks only a live-candidate list (coins passing
+// the static entry filters, kept in first-seen order) instead of every
+// mint ever seen, and the committed-position count is computed once per
+// batch. The filters and their order are unchanged, so the orders decided
+// are the same — only the work per batch is bounded.
 import { runBot } from './vendor/makefun-bot.ts';
 
 // ------------------------------------------------------------------ tuning
@@ -60,6 +66,9 @@ function atMostBps(priceNum: bigint, priceDen: bigint, baseNum: bigint, baseDen:
 
 // ------------------------------------------------------------------ per-coin bookkeeping
 interface Coin {
+  mint: string; // base58 mint this record tracks
+  orderIndex: number; // first-seen sequence: decides newest-first scan order
+  inCandidates: boolean; // true while this coin sits in the `candidates` list
   firstNum: bigint; // price (quote/token) when first seen
   firstDen: bigint;
   lastNum: bigint; // latest price seen
@@ -77,11 +86,70 @@ interface Coin {
 }
 
 const coins = new Map<string, Coin>();
+let nextOrderIndex = 0;
+
+// Coins that currently pass every entry filter that depends only on the
+// coin's own record (trade count, recent buys, rise from first sighting).
+// Kept sorted ascending by first-seen order; decideBuys scans it from the
+// end, which is exactly the newest-first order the old full-Map scan used.
+// A coin's own record only changes when it trades, so membership is
+// re-evaluated at trade time and is exact at every decideBuys call — the
+// scan stays bounded by the handful of coins that are actually live
+// candidates instead of growing with every mint the replay has ever seen.
+// The dynamic filters (position, pending, cooldown, curve state, reserves,
+// cap, cash) are still evaluated per candidate at decide time, unchanged.
+const candidates: Coin[] = [];
+
+function insertCandidate(c: Coin): void {
+  let lo = 0;
+  let hi = candidates.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (candidates[mid].orderIndex < c.orderIndex) lo = mid + 1;
+    else hi = mid;
+  }
+  candidates.splice(lo, 0, c);
+  c.inCandidates = true;
+}
+
+function removeCandidate(c: Coin): void {
+  if (!c.inCandidates) return;
+  let lo = 0;
+  let hi = candidates.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (candidates[mid].orderIndex < c.orderIndex) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo < candidates.length && candidates[lo] === c) candidates.splice(lo, 1);
+  c.inCandidates = false;
+}
+
+// The entry filters that depend only on this coin's own record — the same
+// predicates decideBuys applies, shared so membership and the decide-time
+// checks can never drift apart.
+function staticallyEligible(c: Coin): boolean {
+  if (c.trades < ENTRY_MIN_TRADES || c.trades > ENTRY_MAX_TRADES) return false;
+  if (c.recentBuys.length < ENTRY_MIN_TRADES || c.buyCount < ENTRY_MIN_BUYS) return false;
+  if (c.recentBuys[c.recentBuys.length - 1] !== true) return false;
+  if (c.firstNum <= 0n || c.lastNum <= 0n) return false;
+  const rise = priceUpBps(c.firstNum, c.firstDen, c.lastNum, c.lastDen);
+  return rise >= BigInt(ENTRY_RISE_BPS) && rise <= BigInt(ENTRY_MAX_RUNUP_BPS);
+}
+
+function updateCandidate(c: Coin): void {
+  if (staticallyEligible(c)) {
+    if (!c.inCandidates) insertCandidate(c);
+  } else if (c.inCandidates) {
+    removeCandidate(c);
+  }
+}
 
 function getCoin(mint: string): Coin {
   let c = coins.get(mint);
   if (c === undefined) {
     c = {
+      mint, orderIndex: nextOrderIndex++, inCandidates: false,
       firstNum: 0n, firstDen: 1n, lastNum: 0n, lastDen: 1n,
       trades: 0, recentBuys: [], buyCount: 0,
       cooldownUntil: -1, entrySlot: -1, entryTrades: 0,
@@ -119,8 +187,17 @@ function observeEvents(state: any, batch: any): void {
       if (c.recentBuys.length > ENTRY_BUY_WINDOW) {
         if (c.recentBuys.shift() === true) c.buyCount -= 1;
       }
+      // A trade is the only thing that can change this coin's static
+      // eligibility, so re-evaluate candidate membership here.
+      updateCandidate(c);
+    } else if (e.event === 'CompleteEvent') {
+      // A completed curve can never be bought again: drop it from the
+      // candidate scan. decideBuys still checks curve.complete at decide
+      // time, so this is purely a scan prune.
+      const c = coins.get(e.mint);
+      if (c !== undefined) removeCandidate(c);
     }
-    // CompleteEvent needs no record: state.curves already marks it complete.
+    // CompleteEvent needs no other record: state.curves already marks it complete.
   }
   void state;
 }
@@ -178,7 +255,10 @@ function decideSells(state: any): any[] {
 // ------------------------------------------------------------------ entries
 function decideBuys(state: any): any[] {
   const buys: any[] = [];
-  if (state.committedPositionCount() >= MAX_POSITIONS) return buys;
+  // Positions and pending orders do not change during this call, so the
+  // committed count is loop-invariant: compute it once, not per coin.
+  const committed = state.committedPositionCount();
+  if (committed >= MAX_POSITIONS) return buys;
   const freeCash = state.freeCashLamports();
   const txFee = state.txFeeLamports();
   let remaining = freeCash;
@@ -186,17 +266,19 @@ function decideBuys(state: any): any[] {
   for (const p of state.pending.values()) {
     if (p.order.side === 'buy') pendingBuy.add(p.order.mint);
   }
-  // Freshest coins first: iterate first-seen order, newest last, so take
-  // from the end. Map preserves insertion order.
-  const mints = [...coins.keys()].reverse();
-  for (const mint of mints) {
-    if (state.committedPositionCount() + buys.length >= MAX_POSITIONS) break;
+  // Scan the live-candidate list newest-first (it is sorted ascending by
+  // first-seen order, so scanning from the end matches the old full-Map
+  // scan's order exactly). Every filter below is the same as before, in
+  // the same order; membership only guarantees the static ones, it never
+  // replaces the decide-time checks.
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    const c = candidates[i];
+    const mint = c.mint;
+    if (committed + buys.length >= MAX_POSITIONS) break;
     if (state.positions.has(mint)) continue;
     if (pendingBuy.has(mint)) continue;
     const curve = state.curves.get(mint);
     if (curve === undefined || curve.complete) continue;
-    const c = coins.get(mint);
-    if (c === undefined) continue;
     if (state.slot < c.cooldownUntil) continue;
     if (c.trades < ENTRY_MIN_TRADES || c.trades > ENTRY_MAX_TRADES) continue;
     if (c.recentBuys.length < ENTRY_MIN_TRADES || c.buyCount < ENTRY_MIN_BUYS) continue;
